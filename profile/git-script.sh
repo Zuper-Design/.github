@@ -47,6 +47,74 @@ init_repo_if_needed () {
   fi
 }
 
+ensure_gitignore_node_modules () {
+  # Ensure .gitignore exists and contains node_modules/
+  if [[ ! -f ".gitignore" ]]; then
+    echo "🧩 No .gitignore found. Creating one..."
+    cat > .gitignore <<'EOF'
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.*
+EOF
+    echo "✅ Created .gitignore (includes node_modules/)."
+    return 0
+  fi
+
+  # .gitignore exists: ensure node_modules is ignored
+  if grep -Eq '^[[:space:]]*node_modules/?[[:space:]]*$' ".gitignore"; then
+    echo "✅ .gitignore already ignores node_modules/."
+  else
+    echo "⚠️  .gitignore exists but does not ignore node_modules/."
+    if prompt_yes_no "Add 'node_modules/' to .gitignore now?" "Y"; then
+      # Add a newline if file doesn't end with one, then append
+      tail -c 1 ".gitignore" | read -r _ || echo >> ".gitignore"
+      echo "" >> ".gitignore"
+      echo "# Dependencies" >> ".gitignore"
+      echo "node_modules/" >> ".gitignore"
+      echo "✅ Added node_modules/ to .gitignore."
+    else
+      echo "⚠️  Skipping. You may accidentally commit node_modules."
+    fi
+  fi
+}
+
+warn_if_node_modules_tracked () {
+  # If node_modules is already tracked, warn and optionally untrack it.
+  if git ls-files -z | tr '\0' '\n' | grep -qE '^node_modules/'; then
+    echo "🚨 node_modules appears to be TRACKED by git already."
+    echo "   This usually happens if .gitignore was added after committing."
+    if prompt_yes_no "Remove node_modules from tracking (keeps files on disk)?" "Y"; then
+      git rm -r --cached node_modules >/dev/null 2>&1 || true
+      echo "✅ Removed node_modules from git index (cached)."
+      echo "   It will be excluded going forward due to .gitignore."
+    else
+      echo "⚠️  Leaving node_modules tracked. This will bloat the repo."
+    fi
+  fi
+}
+
 ensure_identity () {
   local name email
 
@@ -172,6 +240,11 @@ main () {
 
   require_git
   init_repo_if_needed
+
+  # Safety first: prevent accidental node_modules commits
+  ensure_gitignore_node_modules
+  warn_if_node_modules_tracked
+
   ensure_identity
   setup_signoff_helpers
   ensure_main_branch
