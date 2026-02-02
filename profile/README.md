@@ -46,3 +46,5 @@ If you want to force push changes:
 ```
 bash git-script.sh -f
 ```
+
+To exit the script, just use Control+C keys
