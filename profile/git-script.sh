@@ -8,6 +8,7 @@ set -euo pipefail
 
 BRANCH_NAME=""
 FORCE_PUSH="false"
+SSH_KEY_PATH=""   # resolved during setup_ssh_key
 
 # -----------------------------
 # Pretty output helpers
@@ -359,6 +360,194 @@ ensure_initial_commit () {
   fi
 }
 
+# ============================================================
+#  SSH KEY SETUP
+# ============================================================
+
+# Ensure ssh-agent is running and return the key path loaded into it.
+# Sets the global SSH_KEY_PATH.
+setup_ssh_key () {
+  h3 "🔑 SSH Key Setup"
+
+  local ssh_dir="${HOME}/.ssh"
+  local config_file="${ssh_dir}/config"
+  mkdir -p "${ssh_dir}"
+  chmod 700 "${ssh_dir}"
+
+  # ── 1. Look for an existing key ──────────────────────────
+  local existing_key=""
+  for candidate in \
+    "${ssh_dir}/id_ed25519" \
+    "${ssh_dir}/id_rsa" \
+    "${ssh_dir}/id_ecdsa" \
+    "${ssh_dir}/id_zuper"
+  do
+    if [[ -f "${candidate}" ]]; then
+      existing_key="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -n "${existing_key}" ]]; then
+    echo "🔑 Found existing SSH key: ${existing_key}"
+    if prompt_yes_no "Use this key for GitHub auth?" "Y"; then
+      SSH_KEY_PATH="${existing_key}"
+    else
+      existing_key=""   # fall through to generate
+    fi
+  fi
+
+  # ── 2. Generate a new key if none chosen ─────────────────
+  if [[ -z "${SSH_KEY_PATH}" ]]; then
+    local email
+    email="$(git config user.email 2>/dev/null || true)"
+    if [[ -z "${email}" ]]; then
+      read -r -p "Enter your work email for the SSH key: " email
+    fi
+
+    local key_file="${ssh_dir}/id_zuper_ed25519"
+    echo "🔐 Generating new ed25519 SSH key..."
+    echo "   → ${key_file}"
+    ssh-keygen -t ed25519 -C "${email}" -f "${key_file}" -N ""
+    SSH_KEY_PATH="${key_file}"
+    echo "✅ Key generated."
+  fi
+
+  # ── 3. Write ~/.ssh/config block for github.com ──────────
+  local config_block
+  config_block="$(cat <<EOF
+
+# Zuper-Design – added by git-script.sh
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ${SSH_KEY_PATH}
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+EOF
+)"
+
+  if [[ ! -f "${config_file}" ]] || ! grep -q "IdentityFile ${SSH_KEY_PATH}" "${config_file}"; then
+    echo "${config_block}" >> "${config_file}"
+    chmod 600 "${config_file}"
+    echo "✅ SSH config updated: ${config_file}"
+  else
+    echo "✅ SSH config already has an entry for this key."
+  fi
+
+  # ── 4. Start ssh-agent and load the key ──────────────────
+  # macOS: use the system Keychain agent; fallback to manual agent start.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    # macOS ssh-agent is managed by launchd; just add the key via Keychain
+    ssh-add --apple-use-keychain "${SSH_KEY_PATH}" 2>/dev/null \
+      || ssh-add "${SSH_KEY_PATH}" 2>/dev/null \
+      || true
+  else
+    # Linux / other: start agent if not running
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+      eval "$(ssh-agent -s)" >/dev/null
+    fi
+    ssh-add "${SSH_KEY_PATH}" 2>/dev/null || true
+  fi
+
+  echo "✅ SSH key loaded into agent: ${SSH_KEY_PATH}"
+
+  # ── 5. Show public key + instructions ────────────────────
+  local pub_key_file="${SSH_KEY_PATH}.pub"
+  echo
+  echo "════════════════════════════════════════════"
+  echo "  📋 Your SSH public key (copy this entire line):"
+  echo "════════════════════════════════════════════"
+  cat "${pub_key_file}"
+  echo "════════════════════════════════════════════"
+  echo
+  echo "  Add it to GitHub:"
+  echo "  1. Open  → https://github.com/settings/ssh/new"
+  echo "  2. Title → e.g. \"$(hostname -s) – Zuper Design\""
+  echo "  3. Paste → the key above"
+  echo "  4. Click → Add SSH key"
+  echo
+  echo "  To push to the zuper-design org, a member with"
+  echo "  Owner/Admin access may also need to approve the key"
+  echo "  under: https://github.com/orgs/zuper-design/sso"
+  echo
+  # Copy to clipboard on macOS silently
+  if command -v pbcopy >/dev/null 2>&1; then
+    cat "${pub_key_file}" | pbcopy
+    echo "  ✂️  Public key copied to clipboard automatically."
+    echo
+  fi
+
+  prompt_yes_no "Press Y once you've added the key to GitHub to continue" "Y" || {
+    echo "❌ Aborted. Re-run the script after adding the key."
+    exit 1
+  }
+}
+
+# ============================================================
+#  SSH CONNECTION TEST
+# ============================================================
+
+test_github_ssh () {
+  h3 "🧪 Testing GitHub SSH Connection"
+
+  local result exit_code
+  # ssh -T exits with code 1 even on success ("Hi username!"), so capture both
+  result="$(ssh -T -o StrictHostKeyChecking=accept-new git@github.com 2>&1)" || exit_code=$?
+
+  if echo "${result}" | grep -q "^Hi "; then
+    local gh_user
+    gh_user="$(echo "${result}" | sed "s/^Hi //; s/!.*$//")"
+    echo "✅ GitHub SSH auth confirmed. Logged in as: ${gh_user}"
+
+    # Warn if the authenticated account isn't obviously a Zuper member
+    if ! echo "${gh_user}" | grep -qi "zuper"; then
+      echo
+      echo "  ⚠️  Heads-up: your GitHub user '${gh_user}' doesn't look like"
+      echo "     a Zuper account. Make sure this account has access to"
+      echo "     github.com/zuper-design before pushing."
+    fi
+  else
+    echo "❌ SSH handshake failed. GitHub responded:"
+    echo "   ${result}"
+    echo
+    echo "  Possible causes:"
+    echo "  • Key not yet added to GitHub (https://github.com/settings/ssh/new)"
+    echo "  • Key not authorized for the zuper-design org"
+    echo "    (https://github.com/orgs/zuper-design/sso)"
+    echo "  • Key not loaded in ssh-agent"
+    echo
+    if prompt_yes_no "Retry SSH test after fixing the above?" "Y"; then
+      test_github_ssh
+    else
+      echo "❌ Aborting. Fix SSH auth and re-run the script."
+      exit 1
+    fi
+  fi
+}
+
+# ============================================================
+#  URL NORMALIZATION  (HTTPS → SSH)
+# ============================================================
+
+# Converts https://github.com/org/repo.git  →  git@github.com:org/repo.git
+# Leaves git@github.com:... URLs untouched.
+convert_url_to_ssh () {
+  local url="${1}"
+  if echo "${url}" | grep -qE '^https://github\.com/'; then
+    # Strip protocol + host, keep path
+    local path
+    path="$(echo "${url}" | sed 's|^https://github\.com/||')"
+    echo "git@github.com:${path}"
+  else
+    echo "${url}"
+  fi
+}
+
+# ============================================================
+#  PUSH
+# ============================================================
+
 set_remote_and_push () {
   h3 "🚀 Push to GitHub"
 
@@ -369,16 +558,25 @@ set_remote_and_push () {
     echo "🔗 Remote 'origin' already set to:"
     echo "   ${remote_url}"
     if ! prompt_yes_no "Do you want to keep this remote?" "Y"; then
-      read -r -p "Paste the correct repo URL: " remote_url
+      read -r -p "Paste the correct repo URL (HTTPS or SSH): " remote_url
       git remote set-url origin "${remote_url}"
     fi
   else
-    read -r -p "Paste the GitHub repo URL to push to: " remote_url
+    read -r -p "Paste the GitHub repo URL to push to (HTTPS or SSH): " remote_url
     if [[ -z "${remote_url}" ]]; then
       echo "❌ Repo URL cannot be empty."
       exit 1
     fi
     git remote add origin "${remote_url}"
+  fi
+
+  # ── Normalise to SSH ──────────────────────────────────────
+  local ssh_url
+  ssh_url="$(convert_url_to_ssh "${remote_url}")"
+  if [[ "${ssh_url}" != "${remote_url}" ]]; then
+    echo "🔄 Converting remote from HTTPS → SSH:"
+    echo "   ${ssh_url}"
+    git remote set-url origin "${ssh_url}"
   fi
 
   git fetch origin >/dev/null 2>&1 || true
@@ -396,6 +594,10 @@ set_remote_and_push () {
   echo "✅ Done! Your project is now pushed."
 }
 
+# ============================================================
+#  MAIN
+# ============================================================
+
 main () {
   parse_args "$@"
 
@@ -411,6 +613,11 @@ main () {
   choose_branch
   ensure_identity
   setup_signoff_helpers
+
+  # SSH must come after identity (key comment uses email)
+  setup_ssh_key
+  test_github_ssh
+
   if git rev-parse --verify HEAD >/dev/null 2>&1; then
     if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
       git checkout "${BRANCH_NAME}"
