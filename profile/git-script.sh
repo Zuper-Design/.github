@@ -426,7 +426,14 @@ setup_ssh_key () {
     read -r -p "Enter your work email for the SSH key: " email
   fi
 
+  # Avoid ssh-keygen's own "Overwrite?" prompt — pick a unique filename
   local key_file="${ssh_dir}/id_zuper_ed25519"
+  if [[ -f "${key_file}" ]]; then
+    key_file="${ssh_dir}/id_zuper_ed25519_$(date +%Y%m%d%H%M%S)"
+    echo "ℹ️  A key already exists at the default path; using:"
+    echo "   ${key_file}"
+  fi
+
   echo "🔐 Generating new ed25519 SSH key..."
   echo "   → ${key_file}"
   ssh-keygen -t ed25519 -C "${email}" -f "${key_file}" -N ""
