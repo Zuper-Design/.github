@@ -8,7 +8,8 @@ set -euo pipefail
 
 BRANCH_NAME=""
 FORCE_PUSH="false"
-SSH_KEY_PATH=""   # resolved during setup_ssh_key
+SSH_KEY_PATH=""        # resolved during setup_ssh_key
+USE_EXISTING_KEY="false"   # set to true when user opts to reuse an existing key
 
 # -----------------------------
 # Pretty output helpers
@@ -364,8 +365,6 @@ ensure_initial_commit () {
 #  SSH KEY SETUP
 # ============================================================
 
-# Ensure ssh-agent is running and return the key path loaded into it.
-# Sets the global SSH_KEY_PATH.
 setup_ssh_key () {
   h3 "🔑 SSH Key Setup"
 
@@ -388,32 +387,70 @@ setup_ssh_key () {
     fi
   done
 
+  # ── 2. If a key exists, ask: use it or create a new one ──
   if [[ -n "${existing_key}" ]]; then
     echo "🔑 Found existing SSH key: ${existing_key}"
-    if prompt_yes_no "Use this key for GitHub auth?" "Y"; then
-      SSH_KEY_PATH="${existing_key}"
-    else
-      existing_key=""   # fall through to generate
-    fi
+    echo
+    echo "  What would you like to do?"
+    echo "  [1] Use existing key → proceed to repo setup"
+    echo "  [2] Create a new key"
+    echo
+
+    local choice
+    while true; do
+      read -r -p "Enter 1 or 2 [1]: " choice || true
+      choice="${choice:-1}"
+      case "${choice}" in
+        1)
+          SSH_KEY_PATH="${existing_key}"
+          USE_EXISTING_KEY="true"
+          echo "✅ Using existing key: ${SSH_KEY_PATH}"
+          _load_key_into_agent
+          return 0   # ← skip new-key generation + GitHub instructions
+          ;;
+        2)
+          echo "🆕 Proceeding to create a new key..."
+          break      # ← fall through to generation below
+          ;;
+        *)
+          echo "Please enter 1 or 2."
+          ;;
+      esac
+    done
   fi
 
-  # ── 2. Generate a new key if none chosen ─────────────────
-  if [[ -z "${SSH_KEY_PATH}" ]]; then
-    local email
-    email="$(git config user.email 2>/dev/null || true)"
-    if [[ -z "${email}" ]]; then
-      read -r -p "Enter your work email for the SSH key: " email
-    fi
-
-    local key_file="${ssh_dir}/id_zuper_ed25519"
-    echo "🔐 Generating new ed25519 SSH key..."
-    echo "   → ${key_file}"
-    ssh-keygen -t ed25519 -C "${email}" -f "${key_file}" -N ""
-    SSH_KEY_PATH="${key_file}"
-    echo "✅ Key generated."
+  # ── 3. Generate a new key ─────────────────────────────────
+  local email
+  email="$(git config user.email 2>/dev/null || true)"
+  if [[ -z "${email}" ]]; then
+    read -r -p "Enter your work email for the SSH key: " email
   fi
 
-  # ── 3. Write ~/.ssh/config block for github.com ──────────
+  local key_file="${ssh_dir}/id_zuper_ed25519"
+  echo "🔐 Generating new ed25519 SSH key..."
+  echo "   → ${key_file}"
+  ssh-keygen -t ed25519 -C "${email}" -f "${key_file}" -N ""
+  SSH_KEY_PATH="${key_file}"
+  echo "✅ Key generated."
+
+  # ── 4. Write ~/.ssh/config block for github.com ──────────
+  _write_ssh_config "${config_file}"
+
+  # ── 5. Load key into agent ────────────────────────────────
+  _load_key_into_agent
+
+  # ── 6. Show public key + GitHub instructions ─────────────
+  _show_pubkey_instructions
+
+  prompt_yes_no "Press Y once you've added the key to GitHub to continue" "Y" || {
+    echo "❌ Aborted. Re-run the script after adding the key."
+    exit 1
+  }
+}
+
+# Helper: write (or skip) the ~/.ssh/config block
+_write_ssh_config () {
+  local config_file="${1}"
   local config_block
   config_block="$(cat <<EOF
 
@@ -434,25 +471,25 @@ EOF
   else
     echo "✅ SSH config already has an entry for this key."
   fi
+}
 
-  # ── 4. Start ssh-agent and load the key ──────────────────
-  # macOS: use the system Keychain agent; fallback to manual agent start.
+# Helper: add key to ssh-agent / macOS Keychain
+_load_key_into_agent () {
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    # macOS ssh-agent is managed by launchd; just add the key via Keychain
     ssh-add --apple-use-keychain "${SSH_KEY_PATH}" 2>/dev/null \
       || ssh-add "${SSH_KEY_PATH}" 2>/dev/null \
       || true
   else
-    # Linux / other: start agent if not running
     if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
       eval "$(ssh-agent -s)" >/dev/null
     fi
     ssh-add "${SSH_KEY_PATH}" 2>/dev/null || true
   fi
-
   echo "✅ SSH key loaded into agent: ${SSH_KEY_PATH}"
+}
 
-  # ── 5. Show public key + instructions ────────────────────
+# Helper: print public key + GitHub add-key instructions
+_show_pubkey_instructions () {
   local pub_key_file="${SSH_KEY_PATH}.pub"
   echo
   echo "════════════════════════════════════════════"
@@ -471,17 +508,11 @@ EOF
   echo "  Owner/Admin access may also need to approve the key"
   echo "  under: https://github.com/orgs/zuper-design/sso"
   echo
-  # Copy to clipboard on macOS silently
   if command -v pbcopy >/dev/null 2>&1; then
     cat "${pub_key_file}" | pbcopy
     echo "  ✂️  Public key copied to clipboard automatically."
     echo
   fi
-
-  prompt_yes_no "Press Y once you've added the key to GitHub to continue" "Y" || {
-    echo "❌ Aborted. Re-run the script after adding the key."
-    exit 1
-  }
 }
 
 # ============================================================
@@ -492,7 +523,6 @@ test_github_ssh () {
   h3 "🧪 Testing GitHub SSH Connection"
 
   local result exit_code
-  # ssh -T exits with code 1 even on success ("Hi username!"), so capture both
   result="$(ssh -T -o StrictHostKeyChecking=accept-new git@github.com 2>&1)" || exit_code=$?
 
   if echo "${result}" | grep -q "^Hi "; then
@@ -500,7 +530,6 @@ test_github_ssh () {
     gh_user="$(echo "${result}" | sed "s/^Hi //; s/!.*$//")"
     echo "✅ GitHub SSH auth confirmed. Logged in as: ${gh_user}"
 
-    # Warn if the authenticated account isn't obviously a Zuper member
     if ! echo "${gh_user}" | grep -qi "zuper"; then
       echo
       echo "  ⚠️  Heads-up: your GitHub user '${gh_user}' doesn't look like"
@@ -530,12 +559,9 @@ test_github_ssh () {
 #  URL NORMALIZATION  (HTTPS → SSH)
 # ============================================================
 
-# Converts https://github.com/org/repo.git  →  git@github.com:org/repo.git
-# Leaves git@github.com:... URLs untouched.
 convert_url_to_ssh () {
   local url="${1}"
   if echo "${url}" | grep -qE '^https://github\.com/'; then
-    # Strip protocol + host, keep path
     local path
     path="$(echo "${url}" | sed 's|^https://github\.com/||')"
     echo "git@github.com:${path}"
@@ -616,7 +642,12 @@ main () {
 
   # SSH must come after identity (key comment uses email)
   setup_ssh_key
-  test_github_ssh
+
+  # Skip the SSH connection test when reusing an existing key —
+  # the user opted to proceed directly to repo setup.
+  if [[ "${USE_EXISTING_KEY}" == "false" ]]; then
+    test_github_ssh
+  fi
 
   if git rev-parse --verify HEAD >/dev/null 2>&1; then
     if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
